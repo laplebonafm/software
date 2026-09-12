@@ -1,194 +1,133 @@
 using System;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
-using NAudio.Wave;
-using VirtualStreamPlayer.Audio;
 using VirtualStreamPlayer.Logging;
 
 namespace VirtualStreamPlayer.Streaming
 {
-    public enum PlaybackState
-    {
-        Stopped,
-        Connecting,
-        Playing,
-        Reconnecting
-    }
-
     /// <summary>
-    /// Owns the full pipeline: open the streaming URL, decode it to PCM, and
-    /// keep it running forever with automatic reconnection on any failure
-    /// (network drop, server hiccup, decode error). Does NOT touch any audio
-    /// device - it only produces PCM bytes and format info for whoever is
-    /// listening to <see cref="PcmChunkReady"/> (the named pipe server).
+    /// Windows Media Foundation can open an HTTP URL directly and decode
+    /// whatever codec is inside (MP3, AAC/AAC+, ...), but it does not know
+    /// about the SHOUTcast/Icecast "icy-metaint" inline metadata trick, so it
+    /// can't be pointed at the original station URL when that's in use - the
+    /// embedded metadata blocks would be decoded as if they were audio and
+    /// corrupt the sound every "metaint" bytes.
     ///
-    /// Decoding is done through Windows Media Foundation
-    /// (NAudio.Wave.MediaFoundationReader), which natively supports MP3,
-    /// AAC/AAC+ and HLS (.m3u8) on Windows 8.1+ - so all three formats share
-    /// the same code path:
-    ///
-    ///   - HLS (.m3u8): the playlist/segment fetching is entirely handled by
-    ///     Media Foundation, so the original URL is handed to it directly.
-    ///   - Direct MP3/AAC (Shoutcast/Icecast style): these almost always use
-    ///     the "icy-metaint" inline metadata trick, which Media Foundation
-    ///     does not understand. So the station is opened once here, its
-    ///     inline metadata is stripped by <see cref="IcyMetadataStream"/>,
-    ///     and the clean bytes are re-served locally by
-    ///     <see cref="LocalRelayServer"/> - THAT loopback URL is what gets
-    ///     handed to Media Foundation, whether the codec inside is MP3 or AAC.
+    /// This class re-serves an already-clean audio byte stream (metadata
+    /// already stripped by <see cref="IcyMetadataStream"/>) as a plain local
+    /// HTTP stream on 127.0.0.1, so MediaFoundationReader can open THAT
+    /// instead and never has to deal with ICY at all. Only reachable on
+    /// loopback - never exposed to the network.
     /// </summary>
-    public class PlaybackEngine : IDisposable
+    public class LocalRelayServer : IDisposable
     {
-        private readonly StreamClient _streamClient = new();
+        private readonly Stream _source;
+        private readonly string _contentType;
+        private HttpListener? _listener;
         private CancellationTokenSource? _cts;
-        private Task? _runTask;
 
-        public string? CurrentUrl { get; private set; }
-        public PlaybackState State { get; private set; } = PlaybackState.Stopped;
-        public AudioFormatInfo? CurrentFormat { get; private set; }
-        public string? CurrentTitle { get; private set; }
-        public string? StationName { get; private set; }
-        public long BytesDecoded { get; private set; }
-        public int ReconnectAttempts { get; private set; }
-        public DateTime? ConnectedSince { get; private set; }
+        public int Port { get; private set; }
 
-        public int MaxReconnectDelaySeconds { get; set; } = 30;
-
-        public event Action<PlaybackState>? StateChanged;
-        public event Action<AudioFormatInfo>? FormatReady;
-        public event Action<byte[]>? PcmChunkReady;
-        public event Action<string>? TitleChanged;
-        public event Action<string>? Log;
-
-        public void Start(string url)
+        public LocalRelayServer(Stream source, string contentType)
         {
-            Stop();
-            CurrentUrl = url;
-            _cts = new CancellationTokenSource();
-            _runTask = Task.Run(() => RunLoopAsync(url, _cts.Token));
+            _source = source;
+            _contentType = string.IsNullOrWhiteSpace(contentType) ? "audio/mpeg" : contentType;
         }
 
-        public void Stop()
+        /// <summary>Starts the relay and returns the local URL to hand to MediaFoundationReader.</summary>
+        public string Start()
+        {
+            Port = GetFreeLoopbackPort();
+            _listener = new HttpListener();
+            _listener.Prefixes.Add($"http://127.0.0.1:{Port}/");
+            _listener.Start();
+            _cts = new CancellationTokenSource();
+            _ = Task.Run(() => ServeSingleConsumerAsync(_cts.Token));
+            return $"http://127.0.0.1:{Port}/live{ExtensionForContentType(_contentType)}";
+        }
+
+        /// <summary>
+        /// Media Foundation resolves which codec byte-stream handler to use mainly
+        /// from the URL's file extension, not just the HTTP Content-Type header -
+        /// an extension-less URL like ".../live" fails with
+        /// MF_E_UNSUPPORTED_BYTESTREAM_TYPE (0xC00D0029) even though the content
+        /// type is correct. So the relay URL always carries a real extension.
+        /// </summary>
+        private static string ExtensionForContentType(string contentType)
+        {
+            var ct = contentType.ToLowerInvariant();
+            if (ct.Contains("aac")) return ".aac";
+            if (ct.Contains("mpeg") || ct.Contains("mp3")) return ".mp3";
+            return ".mp3"; // reasonable default for unknown Shoutcast/Icecast content types
+        }
+
+        private async Task ServeSingleConsumerAsync(CancellationToken ct)
+        {
+            try
+            {
+                // Media Foundation's HTTP source often probes with a HEAD request
+                // first (to check content type / whether ranges are supported)
+                // before opening the real streaming GET. We must answer that probe
+                // and then keep listening - otherwise the probe consumes our only
+                // accepted connection and the real GET never gets served, which
+                // makes MediaFoundationReader hang forever with no data and no
+                // error.
+                while (!ct.IsCancellationRequested)
+                {
+                    var ctx = await _listener!.GetContextAsync();
+
+                    if (ctx.Request.HttpMethod == "HEAD")
+                    {
+                        ctx.Response.ContentType = _contentType;
+                        ctx.Response.Headers["Accept-Ranges"] = "none";
+                        ctx.Response.StatusCode = 200;
+                        ctx.Response.Close();
+                        continue; // keep listening for the real GET
+                    }
+
+                    // This is the real audio request - serve it until the source
+                    // stream ends or the consumer disconnects, then we're done
+                    // (the underlying station connection is single-use).
+                    ctx.Response.ContentType = _contentType;
+                    ctx.Response.Headers["Accept-Ranges"] = "none";
+                    ctx.Response.SendChunked = true;
+                    ctx.Response.StatusCode = 200;
+
+                    var buffer = new byte[8192];
+                    while (!ct.IsCancellationRequested)
+                    {
+                        int read = await _source.ReadAsync(buffer.AsMemory(0, buffer.Length), ct);
+                        if (read <= 0) break;
+                        await ctx.Response.OutputStream.WriteAsync(buffer.AsMemory(0, read), ct);
+                        await ctx.Response.OutputStream.FlushAsync(ct);
+                    }
+                    return;
+                }
+            }
+            catch (Exception)
+            {
+                // Origin dropped, MF consumer disconnected, or cancelled - all normal shutdown paths.
+            }
+        }
+
+        private static int GetFreeLoopbackPort()
+        {
+            var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            listener.Stop();
+            return port;
+        }
+
+        public void Dispose()
         {
             _cts?.Cancel();
-            try { _runTask?.Wait(TimeSpan.FromSeconds(5)); } catch { /* ignore */ }
-            _cts = null;
-            _runTask = null;
-            CurrentFormat = null;
-            SetState(PlaybackState.Stopped);
-            ConnectedSince = null;
+            try { _listener?.Stop(); } catch { /* ignore */ }
+            try { _listener?.Close(); } catch { /* ignore */ }
+            try { _source.Dispose(); } catch { /* ignore */ }
         }
-
-        private async Task RunLoopAsync(string url, CancellationToken ct)
-        {
-            int attempt = 0;
-            while (!ct.IsCancellationRequested)
-            {
-                SetState(attempt == 0 ? PlaybackState.Connecting : PlaybackState.Reconnecting);
-                ReconnectAttempts = attempt;
-
-                try
-                {
-                    await PlayOnceAsync(url, ct);
-                    if (ct.IsCancellationRequested) break;
-                    Log?.Invoke("El stream terminó de forma inesperada, reconectando...");
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    Logger.Error("Error en la reproducción, se intentará reconectar", ex);
-                    Log?.Invoke($"Error: {ex.Message} — reconectando...");
-                }
-
-                attempt++;
-                ConnectedSince = null;
-                CurrentFormat = null;
-                int delaySeconds = Math.Min(MaxReconnectDelaySeconds, (int)Math.Pow(2, Math.Min(attempt, 6)));
-                SetState(PlaybackState.Reconnecting);
-                try
-                {
-                    await Task.Delay(TimeSpan.FromSeconds(delaySeconds), ct);
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-            }
-        }
-
-        private async Task PlayOnceAsync(string url, CancellationToken ct)
-        {
-            if (IsHlsPlaylist(url))
-            {
-                // HLS: Media Foundation fetches the playlist and every segment itself.
-                Log?.Invoke("Detectado playlist HLS (.m3u8) — Media Foundation maneja los segmentos.");
-                await PlayViaMediaFoundationAsync(url, ct);
-                return;
-            }
-
-            var opened = await _streamClient.OpenAsync(url, ct);
-            StationName = opened.StationName;
-            opened.AudioStream.MetadataChanged += title =>
-            {
-                CurrentTitle = title;
-                TitleChanged?.Invoke(title);
-            };
-
-            using var relay = new LocalRelayServer(opened.AudioStream, opened.ContentType ?? "audio/mpeg");
-            var relayUrl = relay.Start();
-
-            Log?.Invoke($"Conectado a {url}" + (StationName != null ? $" ({StationName})" : "") +
-                        $" — tipo: {opened.ContentType ?? "desconocido"}");
-
-            await PlayViaMediaFoundationAsync(relayUrl, ct);
-        }
-
-        private async Task PlayViaMediaFoundationAsync(string url, CancellationToken ct)
-        {
-            using var reader = new MediaFoundationReader(url);
-
-            SetState(PlaybackState.Playing);
-            ConnectedSince = DateTime.Now;
-            ReconnectAttempts = 0;
-
-            var buffer = new byte[16384];
-            while (!ct.IsCancellationRequested)
-            {
-                int read = await Task.Run(() => reader.Read(buffer, 0, buffer.Length), ct);
-                if (read <= 0) return; // stream ended / connection dropped
-
-                if (CurrentFormat == null)
-                {
-                    CurrentFormat = new AudioFormatInfo
-                    {
-                        SampleRate = reader.WaveFormat.SampleRate,
-                        Channels = reader.WaveFormat.Channels,
-                        BitsPerSample = reader.WaveFormat.BitsPerSample
-                    };
-                    FormatReady?.Invoke(CurrentFormat);
-                    Log?.Invoke($"Formato detectado: {CurrentFormat}");
-                }
-
-                BytesDecoded += read;
-                var chunk = new byte[read];
-                Buffer.BlockCopy(buffer, 0, chunk, 0, read);
-                PcmChunkReady?.Invoke(chunk);
-            }
-        }
-
-        private static bool IsHlsPlaylist(string url) =>
-            url.IndexOf(".m3u8", StringComparison.OrdinalIgnoreCase) >= 0;
-
-        private void SetState(PlaybackState state)
-        {
-            if (State == state) return;
-            State = state;
-            StateChanged?.Invoke(state);
-        }
-
-        public void Dispose() => Stop();
     }
 }
