@@ -1,0 +1,64 @@
+name: Build VirtualStreamPlayer
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Instalar .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Publicar VirtualStreamPlayer
+        run: >
+          dotnet publish src/VirtualStreamPlayer/VirtualStreamPlayer.csproj
+          -c Release -r win-x64 --self-contained true
+          -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true
+          -o publish/VirtualStreamPlayer
+
+      - name: Publicar TestPipeClient
+        run: >
+          dotnet publish src/VirtualStreamPlayer.TestPipeClient/VirtualStreamPlayer.TestPipeClient.csproj
+          -c Release -r win-x64 --self-contained true
+          -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true
+          -o publish/VirtualStreamPlayer
+
+      - name: Subir binarios (.exe sueltos, sin instalador)
+        uses: actions/upload-artifact@v4
+        with:
+          name: VirtualStreamPlayer-exe
+          path: publish/VirtualStreamPlayer/**
+
+      - name: Instalar Inno Setup
+        run: choco install innosetup -y
+        shell: cmd
+
+      - name: Compilar instalador (.iss -> Setup.exe)
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\VirtualStreamPlayerSetup.iss
+        shell: pwsh
+
+      - name: Subir instalador
+        uses: actions/upload-artifact@v4
+        with:
+          name: VirtualStreamPlayerSetup
+          path: installer/Output/*.exe
+
+      - name: Publicar como Release (solo cuando subes un tag v1.0.0, v1.0.1, etc.)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer/Output/*.exe
