@@ -46,7 +46,22 @@ namespace VirtualStreamPlayer.Streaming
             _listener.Start();
             _cts = new CancellationTokenSource();
             _ = Task.Run(() => ServeSingleConsumerAsync(_cts.Token));
-            return $"http://127.0.0.1:{Port}/live";
+            return $"http://127.0.0.1:{Port}/live{ExtensionForContentType(_contentType)}";
+        }
+
+        /// <summary>
+        /// Media Foundation resolves which codec byte-stream handler to use mainly
+        /// from the URL's file extension, not just the HTTP Content-Type header -
+        /// an extension-less URL like ".../live" fails with
+        /// MF_E_UNSUPPORTED_BYTESTREAM_TYPE (0xC00D0029) even though the content
+        /// type is correct. So the relay URL always carries a real extension.
+        /// </summary>
+        private static string ExtensionForContentType(string contentType)
+        {
+            var ct = contentType.ToLowerInvariant();
+            if (ct.Contains("aac")) return ".aac";
+            if (ct.Contains("mpeg") || ct.Contains("mp3")) return ".mp3";
+            return ".mp3"; // reasonable default for unknown Shoutcast/Icecast content types
         }
 
         private async Task ServeSingleConsumerAsync(CancellationToken ct)
