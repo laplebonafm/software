@@ -1,0 +1,44 @@
+<Window x:Class="VirtualStreamPlayer.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="VirtualStreamPlayer" Height="520" Width="720"
+        WindowStartupLocation="CenterScreen">
+    <Grid Margin="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,8">
+            <TextBlock Text="URL de streaming:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+            <TextBox x:Name="UrlTextBox" Width="440" VerticalAlignment="Center"/>
+            <Button x:Name="ConnectButton" Content="Conectar" Width="90" Margin="8,0,0,0" Click="ConnectButton_Click"/>
+            <Button x:Name="DisconnectButton" Content="Detener" Width="90" Margin="8,0,0,0" Click="DisconnectButton_Click"/>
+        </StackPanel>
+
+        <Border Grid.Row="1" BorderBrush="Gray" BorderThickness="1" Padding="8" Margin="0,0,0,8">
+            <StackPanel>
+                <TextBlock x:Name="StateText" Text="Estado: detenido" FontWeight="Bold"/>
+                <TextBlock x:Name="StationText" Text="Emisora: -"/>
+                <TextBlock x:Name="TitleText" Text="Reproduciendo: -"/>
+                <TextBlock x:Name="FormatText" Text="Formato: -"/>
+            </StackPanel>
+        </Border>
+
+        <Border Grid.Row="2" BorderBrush="Gray" BorderThickness="1" Padding="8" Margin="0,0,0,8">
+            <StackPanel>
+                <TextBlock FontWeight="Bold" Text="Cómo lo detecta otro programa (sin dispositivo de audio):"/>
+                <TextBlock x:Name="PipePathText" Text="Named pipe: -" Margin="0,4,0,0" FontFamily="Consolas"/>
+                <TextBlock x:Name="ApiUrlText" Text="API local: -" FontFamily="Consolas"/>
+                <TextBlock x:Name="ClientsText" Text="Clientes conectados al pipe: 0"/>
+            </StackPanel>
+        </Border>
+
+        <TextBlock Grid.Row="3" Text="Registro:" FontWeight="Bold" Margin="0,0,0,4"/>
+        <TextBox x:Name="LogTextBox" Grid.Row="4" IsReadOnly="True" VerticalScrollBarVisibility="Auto"
+                 TextWrapping="Wrap" FontFamily="Consolas" FontSize="11"/>
+    </Grid>
+</Window>
